@@ -83,10 +83,10 @@ relayDemo = do
 
     -- Set up some test nodes
     (nodeC1, nodeC2, nodeR, nodeEs, nodeC3) <- M.runProduction $ do
-      nodeC1 <- newNode (C 1) NodeCore  (CommsDelay 0) onConnChange
-      nodeC2 <- newNode (C 2) NodeCore  (CommsDelay 0) onConnChange
-      nodeR  <- newNode (R 1) NodeRelay (CommsDelay 0) onConnChange
-      nodeEs <- forM [1 .. 9] $ \n -> newNode (E n) NodeEdge (CommsDelay 0) onConnChange
+      nodeC1 <- newNode (C 1) NodeCore  (CommsDelay 0) OutQ.defaultConnectionChangeAction
+      nodeC2 <- newNode (C 2) NodeCore  (CommsDelay 0) OutQ.defaultConnectionChangeAction
+      nodeR  <- newNode (R 1) NodeRelay (CommsDelay 0) OutQ.defaultConnectionChangeAction
+      nodeEs <- forM [1 .. 9] $ \n -> newNode (E n) NodeEdge (CommsDelay 0) OutQ.defaultConnectionChangeAction
 
       setPeers nodeR  (nodeC1 : nodeC2 : nodeEs)
       setPeers nodeC1 [nodeR]
@@ -95,8 +95,8 @@ relayDemo = do
       -- Two core nodes that communicate directly with each other
       -- (disjoint from the nodes we set up above)
 
-      nodeC3 <- newNode (C 3) NodeCore (CommsDelay 0) (OutQ.liftConnectionChangeAction onConnChange)
-      nodeC4 <- newNode (C 4) NodeCore (CommsDelay 1000000) onConnChange
+      nodeC3 <- newNode (C 3) NodeCore (CommsDelay 0) OutQ.defaultConnectionChangeAction
+      nodeC4 <- newNode (C 4) NodeCore (CommsDelay 1000000) OutQ.defaultConnectionChangeAction
 
       setPeers nodeC3 [nodeC4]
       return (nodeC1, nodeC2, nodeR, nodeEs, nodeC3)
@@ -108,14 +108,14 @@ relayDemo = do
                     (nodeEs !! 0)
                     (MsgTransaction OriginSender)
                     (MsgId 0)
-                    (OutQ.liftConnectionChangeAction onConnChange)
+                    OutQ.defaultConnectionChangeAction
 
       block "* Basic relay test: code to edge" [nodeR] $ do
         void $ send Asynchronous
                     nodeC1
                     (MsgAnnounceBlockHeader OriginSender)
                     (MsgId 100)
-                    (OutQ.liftConnectionChangeAction onConnChange)
+                    OutQ.defaultConnectionChangeAction
 
       -- In order to test rate limiting, we send a message from all of the edge
       -- nodes at once. These should then arrive at the (single) core node one
@@ -132,7 +132,7 @@ relayDemo = do
                       nodeE
                       (MsgTransaction OriginSender)
                       (MsgId n)
-                      (OutQ.liftConnectionChangeAction onConnChange)
+                      OutQ.defaultConnectionChangeAction
 
       block "* Priorities" [nodeR] $ do
         -- We schedule two transactions and a block header in quick succession.
@@ -143,17 +143,17 @@ relayDemo = do
                     nodeR
                     (MsgTransaction OriginSender)
                     (MsgId n)
-                    (OutQ.liftConnectionChangeAction onConnChange)
+                    OutQ.defaultConnectionChangeAction
           _ <- send Asynchronous
                     nodeR
                     (MsgTransaction OriginSender)
                     (MsgId (n + 1))
-                    (OutQ.liftConnectionChangeAction onConnChange)
+                    OutQ.defaultConnectionChangeAction
           _ <- send Asynchronous
                     nodeR
                     (MsgAnnounceBlockHeader OriginSender)
                     (MsgId (n + 2))
-                    (OutQ.liftConnectionChangeAction onConnChange)
+                    OutQ.defaultConnectionChangeAction
           liftIO $ threadDelay 2500000
 
       block "* Latency masking (and sync API)" [nodeC2] $ do
@@ -165,12 +165,12 @@ relayDemo = do
                     nodeC3
                     (MsgAnnounceBlockHeader OriginSender)
                     (MsgId n)
-                    (OutQ.liftConnectionChangeAction onConnChange)
+                    OutQ.defaultConnectionChangeAction
           void $ send Synchronous
                       nodeC3
                       (MsgMPC OriginSender)
                       (MsgId (n + 1))
-                      (OutQ.liftConnectionChangeAction onConnChange)
+                      OutQ.defaultConnectionChangeAction
 
       block "* Sending to specific nodes" nodeEs $ do
         -- This will send to the relay node
@@ -178,18 +178,15 @@ relayDemo = do
                   nodeC1
                   (MsgRequestBlocks (Set.fromList (nodeId <$> [nodeC2, nodeR])))
                   (MsgId 500)
-                  (OutQ.liftConnectionChangeAction onConnChange)
+                  OutQ.defaultConnectionChangeAction
         -- Edge nodes can never send to core nodes
         void $ send Asynchronous
                     (nodeEs !! 0)
                     (MsgRequestBlocks (Set.fromList (nodeId <$> [nodeC1])))
                     (MsgId 501)
-                    (OutQ.liftConnectionChangeAction onConnChange)
+                    OutQ.defaultConnectionChangeAction
 
       logNotice "End of demo"
-    where
-        onConnChange :: OutQ.ConnectionChangeAction IO NodeId
-        onConnChange = OutQ.ConnectionChangeAction $ \_ -> return ()
 
 {-------------------------------------------------------------------------------
   Model of a node
@@ -225,8 +222,10 @@ newNode nodeId_ nodeType commsDelay onConnChange = liftIO $ do
     nodeId       <- NodeId nodeId_ commsDelay <$> newSyncVar
     nodeMsgPool  <- newMsgPool
     let node = Node{..}
-    _worker   <- forkIO $ runDequeue $ nodeDequeueWorker node (OutQ.liftConnectionChangeAction onConnChange)
-    _listener <- forkIO $ runEnqueue $ nodeForwardListener node (OutQ.liftConnectionChangeAction onConnChange)
+    _worker   <- forkIO $ runDequeue $ nodeDequeueWorker node
+        $ OutQ.liftConnectionChangeAction (M.runProduction . unDequeue) onConnChange
+    _listener <- forkIO $ runEnqueue $ nodeForwardListener node 
+        $ OutQ.liftConnectionChangeAction (M.runProduction . unEnqueue) onConnChange
     return node
 
 -- | Worker that monitors the queue and sends all enqueued messages

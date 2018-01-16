@@ -85,6 +85,7 @@ module Network.Broadcast.OutboundQueue (
   , currentlyInFlight
   ) where
 
+import           Control.Arrow (second, (&&&))
 import           Control.Concurrent
 import           Control.Exception
 import           Control.Lens
@@ -352,31 +353,80 @@ data ConnectionStatus =
     | NotConnected
     deriving (Eq, Ord, Show)
 
+-- | Connection qualifity which depends on EnqueuePolicy.  For 'EnqueueAll',
+-- 'CQAll' is used, while for 'EnqueueOne' 'CQOne' will be used.  This is
+-- inparticular useful to check weather we already tried to connect with all the
+-- nodes when using `EnqueueOne` policy.
+data ConnectionQuality nid =
+      CQAll [(nid, ConnectionStatus)]
+    | CQOne [(nid, ConnectionStatus)]
+        
+
 -- | Connection change callback
-newtype ConnectionChangeAction m nid = ConnectionChangeAction { runConnChange :: Map nid ConnectionStatus -> m () }
+newtype ConnectionChangeAction m nid = ConnectionChangeAction
+    { runConnChange :: Map nid ConnectionStatus
+                    -> (MsgType nid
+                    -> m [ConnectionQuality nid]) -> m ()
+    }
 
+-- | The default 'ConnectionChangeAction'.
 defaultConnectionChangeAction :: (Applicative m) => ConnectionChangeAction m nid
-defaultConnectionChangeAction = ConnectionChangeAction (const $ pure ())
+defaultConnectionChangeAction = ConnectionChangeAction (\_ _ -> pure ())
 
+-- | Lift a 'ConnectionChangeAction IO' to 'MonadIO'.
 liftConnectionChangeAction :: forall m nid. (MonadIO m)
-                           => ConnectionChangeAction IO nid
+                           => (forall a. m a -> IO a)
+                           -> ConnectionChangeAction IO nid
                            -> ConnectionChangeAction m nid
-liftConnectionChangeAction act = ConnectionChangeAction $ liftIO . runConnChange act
+liftConnectionChangeAction unliftIO act = ConnectionChangeAction $ \connStats connQuality ->
+    liftIO (runConnChange act connStats (unliftIO . connQuality))
 
 -- | Helper function which runs 'ConnectionChangeAction' whenever the connection status
 -- changes.
-withConnectionStatuses :: forall m nid a. (MonadIO m, Eq nid, Show nid)
+withConnectionStatuses :: forall m msg buck nid a. (MonadIO m, Eq nid, Show nid)
                        => ConnectionChangeAction m nid
-                       -> MVar (Map nid ConnectionStatus)
+                       -> OutboundQ msg nid buck
                        -> m a
                        -> m a
-withConnectionStatuses onConnChange connStatuses act = do
-    conns <- liftIO $ readMVar connStatuses
+withConnectionStatuses onConnChange outQ@OutQ{..} act = do
+    conns <- liftIO $ readMVar qConnections
     a <- act
-    newConns <- liftIO $ readMVar connStatuses
+    newConns <- liftIO $ readMVar qConnections
     unless (conns == newConns)
-        (runConnChange onConnChange newConns)
+        (runConnChange onConnChange newConns connQuality)
     return a
+    where
+        connQuality :: MsgType nid
+                    -> m [ConnectionQuality nid]
+        connQuality msgType = do
+            connStats <- liftIO $ readMVar qConnections
+            peers <- getAllPeers outQ
+            let enqPolicies = qEnqueuePolicy msgType
+            return $ concatMap (enqueueQuality connStats peers) enqPolicies
+
+            where
+            enqueueQuality :: Map nid ConnectionStatus
+                        -> Peers nid
+                        -> Enqueue
+                        -> [ConnectionQuality nid]
+            enqueueQuality connStats peers EnqueueAll{..} =
+                let fwdSets :: AllOf (Alts nid)
+                    fwdSets = removeOrigin (msgOrigin msgType) $
+                                peersRoutes peers ^. routesOfType enqNodeType
+                in map (CQAll . map (second (fromMaybe NotConnected . flip Map.lookup connStats) . (id &&& id))) fwdSets
+            enqueueQuality connStats peers EnqueueOne{..} =
+                let fwdSets :: AllOf (Alts nid)
+                    fwdSets = concatMap
+                        (\nodeType -> removeOrigin (msgOrigin msgType) $
+                                peersRoutes peers ^. routesOfType nodeType)
+                        enqNodeTypes
+                in map (CQOne . map (second (fromMaybe NotConnected . flip Map.lookup connStats) . (id &&& id))) fwdSets
+
+            removeOrigin :: Origin nid -> AllOf (Alts nid) -> AllOf (Alts nid)
+            removeOrigin origin =
+                case origin of
+                    OriginSender    -> id
+                    OriginForward n -> filter (not . null) . map (filter (/= n))
 
 -- | The outbound queue (opaque data structure)
 --
@@ -759,7 +809,7 @@ intEnqueue :: forall m msg nid buck a. (MonadIO m, WithLogger m)
            -> ConnectionChangeAction m nid
            -> m [Packet msg nid a]
 intEnqueue outQ@OutQ{..} msgType msg peers onConnChange =
-    withConnectionStatuses onConnChange qConnections $ do
+    withConnectionStatuses onConnChange outQ $ do
         fmap concat $
             forM (qEnqueuePolicy msgType) $ \case
 
@@ -875,10 +925,8 @@ intEnqueue outQ@OutQ{..} msgType msg peers onConnChange =
               qSelf msg (map packetDestId enqueued)
 
     alterConnStatus :: Maybe ConnectionStatus -> Maybe ConnectionStatus
-    alterConnStatus Nothing                 = Just Connecting
-    alterConnStatus (Just Connecting)       = Just Connecting
     alterConnStatus (Just Connected)        = Just Connected
-    alterConnStatus (Just ConnectionBroken) = Just Connecting
+    alterConnStatus _                       = Just Connecting
 
 -- | Node ID with current stats needed to pick a node from a list of alts
 data NodeWithStats nid = NodeWithStats {
@@ -1036,7 +1084,7 @@ intDequeue outQ@OutQ{..} threadRegistry@TR{} sendMsg onConnChange = do
               poke qSignal)
 
       forkThread threadRegistry $ \unmask ->
-        withConnectionStatuses onConnChange qConnections $ do
+        withConnectionStatuses onConnChange outQ $ do
             logDebug $ debugSending p
 
             ma <- M.try $ unmask $ sendMsg (packetPayload p) (packetDestId p)

@@ -26,7 +26,7 @@ setupNodes n = M.runProduction $ do
     return ns
     where
         onConnChange :: OutQ.ConnectionChangeAction IO NodeId
-        onConnChange = OutQ.ConnectionChangeAction (const $ return ())
+        onConnChange = OutQ.defaultConnectionChangeAction
 
 testInFlight :: IO Bool
 testInFlight = do
@@ -43,7 +43,7 @@ testInFlight = do
              (allNodes !! 0)
              (MsgTransaction OriginSender)
              (MsgId n)
-             (OutQ.ConnectionChangeAction $ \_ -> return ())
+             OutQ.defaultConnectionChangeAction
       -- Abruptly unsubscribe whilst messages are getting delivered
       forM_ allNodes $ \theNode -> setPeers theNode []
 
@@ -76,12 +76,12 @@ testConnStatus = forAll arbitrary $ \(as :: [Bool]) ->
                       sendingNode
                       (MsgTransaction OriginSender)
                       (MsgId n)
-                      (OutQ.ConnectionChangeAction $ \_ -> return ())
+                      OutQ.defaultConnectionChangeAction
             else sendError Synchronous
                            sendingNode
                            (MsgTransaction OriginSender)
                            (MsgId n)
-                           (OutQ.ConnectionChangeAction $ \_ -> return ())
+                           OutQ.defaultConnectionChangeAction
 
       -- Flush all queues
       forM_ (map nodeOutQ allNodes) OutQ.flush
@@ -113,7 +113,7 @@ testConnChangeAction = forAll arbitrary $ \(as :: [Bool]) ->
         -- Define connection change action
         connsMVar <- newMVar M.empty
         let onConnChange :: OutQ.ConnectionChangeAction IO NodeId
-            onConnChange = OutQ.ConnectionChangeAction $ \conns ->
+            onConnChange = OutQ.ConnectionChangeAction $ \conns _ ->
                 modifyMVar_ connsMVar (const $ return conns)
 
         -- Set up test nodes
@@ -127,12 +127,12 @@ testConnChangeAction = forAll arbitrary $ \(as :: [Bool]) ->
                         sendingNode
                         (MsgTransaction OriginSender)
                         (MsgId n)
-                        (OutQ.liftConnectionChangeAction onConnChange)
+                        (OutQ.liftConnectionChangeAction (M.runProduction . unEnqueue) onConnChange)
               else sendError Asynchronous
                              sendingNode
                              (MsgTransaction OriginSender)
                              (MsgId n)
-                             (OutQ.liftConnectionChangeAction onConnChange)
+                             (OutQ.liftConnectionChangeAction (M.runProduction . unEnqueue) onConnChange)
 
         -- Flush all queues
         forM_ (map nodeOutQ allNodes) OutQ.flush

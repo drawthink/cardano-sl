@@ -16,7 +16,7 @@ import           Universum
 import           Data.Default              (def)
 import           Data.Tagged               (Tagged)
 
-import           Network.Broadcast.OutboundQueue (ConnectionChangeAction(..))
+import           Network.Broadcast.OutboundQueue (ConnectionChangeAction, defaultConnectionChangeAction)
 import           Pos.Communication         (NodeId, TxMsgContents)
 import           Pos.Core.Block            (Block, BlockHeader)
 import           Pos.Core                  (HeaderHash, StakeholderId,
@@ -197,7 +197,7 @@ dummyLogicLayer = LogicLayer
         , recoveryInProgress = pure False
         , securityParams     = def
         , connectionChangeAction
-                             = ConnectionChangeAction (const $ pure ())
+                             = defaultConnectionChangeAction
         }
 
     dummyKeyVal :: Applicative m => KeyVal key val m
