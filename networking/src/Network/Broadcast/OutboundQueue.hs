@@ -349,6 +349,7 @@ data ConnectionStatus =
       Connecting
     | Connected
     | ConnectionBroken
+    | NotConnected
     deriving (Eq, Ord, Show)
 
 -- | Connection change callback
@@ -1404,10 +1405,11 @@ updatePeersBucket outQ@OutQ{..} buck f = do
           buckets' = Map.alter f' buck buckets
           after    = fold buckets'
           removed  = peersSet before Set.\\ peersSet after
+          peers    = peersRouteSet (buckets' Map.! buck)
 
       -- Use the peersRouteSet here because the bucket size is in terms of
       -- routed peers.
-      if    Set.size (peersRouteSet (buckets' Map.! buck))
+      if    Set.size peers
          `exceedsBucketSize`
             qMaxBucketSize buck
         then return (buckets, False)
@@ -1416,7 +1418,10 @@ updatePeersBucket outQ@OutQ{..} buck f = do
             applyMVar_ qInFlight    $ at nid .~ Nothing
             applyMVar_ qFailures    $ Map.delete nid
             applyMVar_ qRateLimited $ Set.delete nid
+            applyMVar_ qConnections $ Map.delete nid
             MQ.removeAllIn (KeyByDest nid) qScheduled
+          let newConns = Map.fromList $ map (,NotConnected) $ Set.elems peers
+          applyMVar_ qConnections $ flip Map.union newConns
           return (buckets', True)
 
     unless success $
